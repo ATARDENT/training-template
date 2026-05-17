@@ -1,0 +1,256 @@
+version: "1.0.0"
+
+# ══════════════════════════════════════════════════════════════════════════
+# GENERAL MODEL TRAINING PIPELINE — CONFIGURATION TEMPLATE
+# ══════════════════════════════════════════════════════════════════════════
+# Sections marked [OPTIONAL] can be omitted or set to null when not applicable.
+# Sections marked [TASK-SPECIFIC] only apply to certain training paradigms.
+
+# ── Model ─────────────────────────────────────────────────────────────────
+model:
+  # Base model: HF hub ID, local path, or null to train from scratch
+  name: "meta-llama/Llama-3.2-3B"
+  # Task: sft | dpo | ppo | classification | regression | causal_lm | seq2seq | masked_lm | embedding | vision | audio | custom
+  task: "sft"
+  # [OPTIONAL] Trust remote code (required for some custom architectures)
+  trust_remote_code: false
+  # [OPTIONAL] Attention impl: eager | sdpa | flash_attention_2
+  attn_implementation: "sdpa"
+  # [OPTIONAL] Quantization for memory-efficient training (e.g. QLoRA)
+  quantization:
+    enabled: false
+    bits: 4                                 # 4 | 8
+    type: "nf4"                             # nf4 | fp4  (4-bit only)
+    double_quant: true                      # nested quantization (4-bit only)
+    compute_dtype: "bfloat16"               # bfloat16 | float16 | float32
+  # [OPTIONAL] Extra kwargs forwarded to the model loader
+  extra_kwargs: {}
+
+# ── Tokenizer / Preprocessing  [TASK-SPECIFIC: text/NLP] ──────────────────
+tokenizer:
+  name: null                                # null = inherit from model.name
+  max_length: 2048
+  padding_side: "right"                     # right | left  (left for causal-LM inference)
+  truncation: true
+  add_special_tokens: true
+  chat_template: null                       # "llama3" | "chatml" | null = default
+  additional_special_tokens: []
+
+# ── Dataset ───────────────────────────────────────────────────────────────
+dataset:
+  deputy: "019e36b8-5df0-71d3-85bb-134205a51118"
+  format: "jsonl"                           # jsonl | csv | parquet | huggingface | custom
+  # Map dataset fields to logical roles (adapt to your task)
+  columns:
+    input: "prompt"                         # source / input text
+    target: "response"                      # target / label
+    label: "category"                       # classification label (if applicable)
+  preprocessing:
+    template: null                          # path to a Jinja template, or null
+    filter_script: null                     # optional row-level filter script
+    max_samples: null                       # cap dataset size; null = use all
+    shuffle_seed: 42
+
+# ── Data split ────────────────────────────────────────────────────────────
+split:
+  train: 0.8                                # must sum to 1.0
+  val:   0.1
+  test:  0.1
+  stratified:
+    enabled: true
+    label_column: "category"
+    num_bins: 5                             # for continuous variables
+    custom:
+      classify_script: "scripts/stratify.py"
+
+# ── Training ──────────────────────────────────────────────────────────────
+training:
+  max_epochs: 10                            # hard stop; set null to use max_steps
+  max_steps: null
+  save_mode: ["checkpoint", "lora"]         # checkpoint | lora  (list allowed)
+  run_test_after: true                      # false skips final test pass
+  resume_from_checkpoint: null              # path | "latest" | null
+
+  # Numerical precision & memory
+  precision: "bf16"                         # fp32 | fp16 | bf16
+  gradient_checkpointing: true              # trade compute for memory
+
+  hyperparameters:
+    learning_rate: 0.0002                   # LoRA: 1e-4 – 5e-4 ; full FT: 1e-5 – 5e-5
+    batch_size: 4                           # per-device
+    eval_batch_size: 8
+    weight_decay: 0.01
+    gradient_clip_val: 1.0
+    gradient_accumulation_steps: 8          # effective batch = batch_size × accum × num_gpus
+    seed: 42
+
+    optimizer:
+      type: "adamw_torch"                   # adamw_torch | adamw_8bit | adafactor | sgd | lion
+      betas: [0.9, 0.999]
+      eps: 1.0e-8
+      fused: true                           # use fused kernel if available
+
+    scheduler:
+      type: "cosine"                        # cosine | linear | constant | polynomial | step
+      # Warmup — pick ONE parameterization, leave the other null
+      warmup_ratio: 0.03
+      warmup_steps: null
+      # Type-specific (only the relevant ones are read)
+      min_lr_ratio: 0.1                     # cosine / linear
+      power: 1.0                            # polynomial
+      step_size: null                       # step scheduler
+      gamma: null                           # step scheduler
+
+  # DataLoader
+  dataloader:
+    num_workers: 4
+    pin_memory: true
+    persistent_workers: true
+    prefetch_factor: 2
+    drop_last: false
+
+  # Distributed / multi-GPU
+  distributed:
+    strategy: "auto"                        # auto | ddp | fsdp | deepspeed | none
+    deepspeed_config: null                  # path to ds_config.json
+    fsdp:
+      sharding_strategy: "FULL_SHARD"       # FULL_SHARD | SHARD_GRAD_OP | NO_SHARD
+      cpu_offload: false
+
+  checkpoints:
+    enabled: true
+    top_k: 3                                # keep N best
+    monitor: "val_loss"
+    mode: "min"                             # "min" for loss, "max" for accuracy
+    save_every_n_steps: null                # null = save per epoch
+    lora:                                   # used only if "lora" is in save_mode
+      r: 16
+      alpha: 32                             # typically 2 × r
+      dropout: 0.05
+      bias: "none"                          # none | all | lora_only
+      task_type: "CAUSAL_LM"                # CAUSAL_LM | SEQ_2_SEQ_LM | SEQ_CLS | TOKEN_CLS
+      target_modules:
+        - q_proj
+        - v_proj
+        - k_proj
+        - o_proj
+      modules_to_save: []                   # fully-trained modules (e.g. classifier head)
+
+  early_stopping:
+    enabled: true
+    monitor: "val_loss"
+    mode: "min"
+    patience: 3
+    min_delta: 0.001
+
+  validation:
+    interval: "epoch"                       # epoch | step
+    frequency: 1                            # every N epochs/steps
+
+  # Metrics computed during val/test (loss is always logged)
+  metrics:
+    - name: "loss"
+    # Examples — uncomment what fits your task:
+    # - name: "perplexity"
+    # - name: "accuracy"
+    # - name: "f1"
+    #   config: { average: "macro" }
+    # - name: "rouge"
+    #   config: { variants: ["rouge1", "rouge2", "rougeL"] }
+    # - name: "bleu"
+
+  monitoring:
+    backend: "tensorboard"                  # tensorboard | wandb | comet | mlflow | none
+    project_name: "my-training-project"
+    run_name: null                          # null = auto-generated
+    log_hyperparameters: true
+    log_model: true
+    log_metrics: true
+    log_every_n_steps: 10
+
+# ── Compute ───────────────────────────────────────────────────────────────
+backend:
+  primary:
+    - name: colab
+      config:
+        instance_type: "A100"               # "T4" | "P100" | "V100" | "A100" | "cpu"
+        high_memory: false
+      max_runtime_hours: 12                 # per-backend cap; switches over when hit
+      max_cost_usd: null
+
+  fallback:                                 # tried in order until one is available
+    - name: thundercompute
+      config:
+        instance_type: "A100"
+        num_gpus: 1
+        min_ram: 16                         # GB
+        disk: 30                            # GB
+        spot: true                          # unified naming across providers
+      max_runtime_hours: 12
+      max_cost_usd: 20
+
+    - name: aws
+      config:
+        instance_type: "g4dn.xlarge"
+        region: "us-east-1"
+        spot: true
+      max_runtime_hours: 12
+      max_cost_usd: 50
+
+  maximum_runtime_hours: 24                 # global cap across all backends
+  retry_on_failure: 1                       # transient retries before switching backend
+
+# ── Output ────────────────────────────────────────────────────────────────
+output:
+  name: "my-model"
+  destination: "idrive_e2e"                 # idrive_e2e | gdrive | huggingface
+  config:
+    idrive_e2e:                             # key now matches destination
+      path: "models/"
+    gdrive:
+      path: "My Drive/models/"
+    huggingface:
+      repo_name: "my-username/my-model-repo"
+      private: true
+
+# ── Version tagging ───────────────────────────────────────────────────────
+tag:
+  enabled: true
+  prefix: "model"                           # tag format: <prefix>-v<version><suffix>
+  suffix: ""
+  github_branch: "main"
+  dvc_file: "model.dvc"
+
+# ── Notifications ─────────────────────────────────────────────────────────
+notifications:
+  enabled: true
+  events:
+    on_start: false
+    on_success: true
+    on_failure: true
+    on_early_stop: true
+    on_backend_fallback: true
+  channels:                                 # now a list — multiple channels supported
+    - type: email
+      config:
+        recipients:
+          - "ardent.hcmus@gmail.com"
+          - "hoangtheanh.tech@gmail.com"
+          - "doraemonidol@gmail.com"
+    # - type: slack
+    #   config:
+    #     webhook_url: "https://hooks.slack.com/services/..."
+    # - type: discord
+    #   config:
+    #     webhook_url: "..."
+
+# ── Reproducibility ───────────────────────────────────────────────────────
+reproducibility:
+  deterministic: false                      # true = fully deterministic (slower)
+  benchmark: true                           # cudnn.benchmark for speed
+  global_seed: 42                           # derives component seeds if not set explicitly
+
+# ── Variables (available as ${var.<name>} for interpolation) ──────────────
+variables:
+  experiment_id: "exp-001"
+  notes: "Baseline run"
